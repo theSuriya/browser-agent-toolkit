@@ -1,0 +1,22 @@
+# Automatic HTTPS reverse proxy in front of the Browser Agent Toolkit.
+# Replace the hostname with your domain, then run Caddy (see the compose file).
+#
+# The browser toolkit is a long-running request/response API (plus MCP over HTTP),
+# so a plain reverse proxy is enough; no websocket upgrades are required.
+
+browser.example.com {
+	encode gzip
+
+	# Give long agent runs and site checks room to finish.
+	reverse_proxy api:8080 {
+		transport http {
+			read_timeout 300s
+			write_timeout 300s
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+	}
+}

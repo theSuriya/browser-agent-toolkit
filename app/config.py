@@ -14,6 +14,14 @@ class Settings(BaseSettings):
     port: int = 8080
     cors_origins: list[str] = ["*"]
 
+    # Auth (API keys)
+    require_auth: bool = True
+    api_keys: str = ""  # comma-separated bootstrap keys, each granted the admin scope
+    db_path: str = "data/keys.db"
+    rate_limit_per_min: int = 120
+    max_sessions_per_key: int = 4
+    mcp_http_path: str = "/mcp"
+
     # Browser
     browser_type: str = "chromium"
     headless: bool = True
@@ -32,6 +40,11 @@ class Settings(BaseSettings):
     # Limits
     max_text_chars: int = 8000
     max_html_chars: int = 20_000
+
+    @property
+    def bootstrap_keys(self) -> list[str]:
+        """Bootstrap admin keys, parsed from the comma-separated ``API_KEYS`` value."""
+        return [key.strip() for key in self.api_keys.split(",") if key.strip()]
 
 
 @lru_cache

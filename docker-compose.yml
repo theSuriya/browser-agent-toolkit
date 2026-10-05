@@ -1,0 +1,35 @@
+services:
+  api:
+    build: .
+    image: browser-agent-toolkit:latest
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+      - ./artifacts:/app/artifacts
+    # Chromium needs more than the default 64 MB /dev/shm.
+    shm_size: "1gb"
+    restart: unless-stopped
+
+  # Optional: automatic HTTPS in front of the API. Uncomment and set your domain
+  # in deploy/Caddyfile, then expose ports 80/443 instead of 8080.
+  # caddy:
+  #   image: caddy:2
+  #   depends_on:
+  #     - api
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+  #     - caddy_data:/data
+  #     - caddy_config:/config
+  #   restart: unless-stopped
+
+# volumes:
+#   caddy_data:
+#   caddy_config:

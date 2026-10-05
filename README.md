@@ -38,10 +38,13 @@ OpenAI-compatible endpoint works: OpenAI, OpenRouter, Groq, Ollama, vLLM).
 ## Run
 
 ```bash
-uvicorn app.main:app --port 8080        # REST API + docs at /docs
-python -m app.mcp_server                # MCP over stdio (Claude Desktop, IDEs)
-MCP_TRANSPORT=streamable-http python -m app.mcp_server   # MCP over HTTP at /mcp
+cp .env.example .env                    # set API_KEYS (an admin key); LLM_API_KEY for agents
+uvicorn app.main:app --port 8080        # REST API + MCP at /mcp + docs at /docs
+python -m app.mcp_server                # MCP over stdio for a local desktop host
 ```
+
+Both the REST API and the MCP endpoint require an API key by default
+(`REQUIRE_AUTH=true`). Set `REQUIRE_AUTH=false` for local development only.
 
 ## See it work (two demos)
 
@@ -92,6 +95,96 @@ curl -X POST localhost:8080/sitecheck -H 'content-type: application/json' \
   -d '{"url": "http://localhost:3000", "required_text": ["Welcome"]}'
 ```
 
+## Authentication (API keys)
+
+Every request needs `Authorization: Bearer <key>`. Keys live **hashed** (SHA-256)
+in a small SQLite database (`DB_PATH`, default `data/keys.db`) and are protected
+by one ASGI middleware in front of the whole app — REST routes and the `/mcp`
+endpoint share the same auth.
+
+Bootstrap an admin key with `API_KEYS` (comma-separated), then mint customer keys:
+
+```bash
+# .env: API_KEYS=my-admin-key
+curl -X POST localhost:8080/admin/keys -H 'Authorization: Bearer my-admin-key' \
+  -H 'content-type: application/json' -d '{"name":"customer-a"}'
+# -> {"id":"...","name":"customer-a","key":"bat_...","scopes":["use"]}   (shown once)
+```
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/admin/keys` | mint a key (admin only) → plaintext shown once |
+| GET | `/admin/keys` | list keys, no secrets (admin only) |
+| DELETE | `/admin/keys/{id}` | revoke a key (admin only) |
+
+Each key gets its **own** browser sessions: another key cannot list, drive or
+close your session (it is reported as `404`, so existence is not leaked), and
+there are per-key caps (`MAX_SESSIONS_PER_KEY`) and rate limits
+(`RATE_LIMIT_PER_MIN`, overridable per key).
+
+## Connect a client
+
+**REST** — send the key on every call:
+
+```bash
+curl localhost:8080/sessions -H 'Authorization: Bearer bat_...'
+```
+
+**Remote MCP (HTTP)** — the endpoint is `https://your-host/mcp` and the client
+sends the key as a bearer header.
+
+Claude Desktop / connectors (`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "browser": {
+      "type": "http",
+      "url": "https://your-host/mcp",
+      "headers": { "Authorization": "Bearer bat_..." }
+    }
+  }
+}
+```
+
+Cursor (`.cursor/mcp.json`) and most clients use the same shape:
+
+```json
+{ "mcpServers": { "browser": { "url": "https://your-host/mcp", "headers": { "Authorization": "Bearer bat_..." } } } }
+```
+
+Raw Python client:
+
+```python
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+
+async with streamablehttp_client("https://your-host/mcp",
+        headers={"Authorization": "Bearer bat_..."}) as (r, w, _):
+    async with ClientSession(r, w) as client:
+        await client.initialize()
+        tools = await client.list_tools()          # 22 tools
+        await client.call_tool("browser_navigate", {"url": "https://example.com"})
+```
+
+**Local MCP (stdio)** — for a single user's own machine, no key needed:
+
+```json
+{ "mcpServers": { "browser": { "command": "python", "args": ["-m", "app.mcp_server"] } } }
+```
+
+## Deploy
+
+```bash
+cp .env.example .env            # set API_KEYS=...
+docker compose up --build       # API on :8080, MCP at /mcp
+```
+
+The image installs Chromium with its system libraries and runs as a non-root
+user. Chromium is memory-hungry — give the host ~1–2 GB per browser and keep
+`MAX_SESSIONS` in step. Put a TLS proxy in front (`deploy/Caddyfile` is a
+ready-to-edit Caddy config that terminates HTTPS for `your-domain/mcp`).
+
 ## Tools the LLM can call
 
 `navigate` · `snapshot` · `click` · `type_text` · `press_key` · `select_option`
@@ -125,8 +218,10 @@ framework, register `app.tools.run_tool` as your tool executor.
 python -m pytest -q
 ```
 
-15+ tests run a real Chromium against a local fixture site, including the agent
-loop driven by a scripted fake LLM, so no API key is needed.
+26 tests run a real Chromium against a local fixture site: the actions, the site
+harness, the agent loop (driven by a scripted fake LLM, no API key needed), and
+the auth suite (401 without a key, cross-key session isolation, revoked keys,
+rate limiting).
 
 ## Layout
 
@@ -134,16 +229,20 @@ loop driven by a scripted fake LLM, so no API key is needed.
 app/
   config.py      settings (.env)
   errors.py      one JSON error shape
+  auth.py        hashed API keys (SQLite), principals, FastAPI dependencies
+  middleware.py  auth + rate limit + security headers + access log (ASGI)
+  ratelimit.py   per-key sliding-window limiter
   snapshot.py    in-page JS that builds the ref-addressable snapshot
-  browser.py     shared browser + isolated per-session contexts
+  browser.py     shared browser + isolated per-key session contexts
   actions.py     18 atomic actions
   tools.py       OpenAI tool specs + dispatcher
   llm.py         minimal OpenAI-compatible async client
   agent.py       the perceive→act→observe loop
   sitecheck.py   the website test harness
-  main.py        FastAPI app
-  mcp_server.py  MCP server
-  routers/       browser, agents, sitecheck
+  main.py        FastAPI app (mounts the MCP server at /mcp)
+  mcp_server.py  MCP server (23 tools, per-key sessions)
+  routers/       browser, agents, sitecheck, admin
 tests/           pytest suite + local fixture site
-examples/        run_agent.py, mcp_client.py
+examples/        run_agent.py, mcp_client.py, demo.py
+deploy/          Caddyfile (TLS reverse proxy)
 ```

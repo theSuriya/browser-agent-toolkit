@@ -38,6 +38,7 @@ class Session:
     page: Page
     created_at: float
     last_used: float
+    owner: str = "local"
     console: list[dict[str, str]] = field(default_factory=list)
     page_errors: list[str] = field(default_factory=list)
     failed_requests: list[dict[str, str]] = field(default_factory=list)
@@ -89,13 +90,17 @@ class BrowserManager:
     def session_count(self) -> int:
         return len(self._sessions)
 
-    def list_sessions(self) -> list[dict[str, Any]]:
+    def list_sessions(self, owner: str | None = None) -> list[dict[str, Any]]:
+        sessions = [s for s in self._sessions.values() if owner is None or s.owner == owner]
         return [
             {"id": s.id, "url": s.page.url, "created_at": s.created_at, "last_used": s.last_used}
-            for s in self._sessions.values()
+            for s in sessions
         ]
 
-    async def create_session(self) -> Session:
+    def owned_count(self, owner: str) -> int:
+        return sum(1 for s in self._sessions.values() if s.owner == owner)
+
+    async def create_session(self, owner: str = "local") -> Session:
         settings = get_settings()
         await self.start()
         await self.reap_idle()
@@ -104,6 +109,12 @@ class BrowserManager:
                 429,
                 "too_many_sessions",
                 f"Session limit ({settings.max_sessions}) reached. Close a session first.",
+            )
+        if self.owned_count(owner) >= settings.max_sessions_per_key:
+            raise AppError(
+                429,
+                "too_many_sessions",
+                f"Session limit per key ({settings.max_sessions_per_key}) reached. Close a session first.",
             )
         assert self._browser is not None
         context = await self._browser.new_context(
@@ -114,7 +125,9 @@ class BrowserManager:
         context.set_default_navigation_timeout(settings.default_timeout_ms)
         page = await context.new_page()
         now = time.monotonic()
-        session = Session(id=uuid.uuid4().hex[:12], context=context, page=page, created_at=now, last_used=now)
+        session = Session(
+            id=uuid.uuid4().hex[:12], context=context, page=page, created_at=now, last_used=now, owner=owner
+        )
         self._attach_listeners(session)
         self._sessions[session.id] = session
         return session
@@ -141,9 +154,11 @@ class BrowserManager:
         page.on("requestfailed", on_request_failed)
         page.on("response", on_response)
 
-    def get(self, session_id: str) -> Session:
+    def get(self, session_id: str, owner: str = "local") -> Session:
         session = self._sessions.get(session_id)
-        if session is None:
+        # A session owned by another key is reported as missing, so its existence
+        # is not leaked and one caller cannot drive another caller's browser.
+        if session is None or session.owner != owner:
             raise AppError(404, "session_not_found", "Unknown session id.")
         session.touch()
         return session

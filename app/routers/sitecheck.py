@@ -1,9 +1,8 @@
 """Website test harness over HTTP."""
 
-from __future__ import annotations
+from fastapi import APIRouter, Depends
 
-from fastapi import APIRouter
-
+from app.auth import Principal, require_key
 from app.browser import manager
 from app.schemas import SiteCheckRequest
 from app.sitecheck import run_site_check
@@ -12,9 +11,9 @@ router = APIRouter(prefix="/sitecheck", tags=["sitecheck"])
 
 
 @router.post("")
-async def check_site(payload: SiteCheckRequest) -> dict:
+async def check_site(payload: SiteCheckRequest, principal: Principal = Depends(require_key)) -> dict:
     """Load a URL in a fresh browser session, run the checks, and close it."""
-    session = await manager.create_session()
+    session = await manager.create_session(owner=principal.key_id)
     try:
         return await run_site_check(
             session,

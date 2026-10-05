@@ -10,8 +10,15 @@ from __future__ import annotations
 
 import functools
 import http.server
+import os
+import tempfile
 import threading
 from pathlib import Path
+
+# The API requires a key by default; tests run with auth off unless a test turns
+# it on (tests/test_auth.py). Keep the key database out of the repository.
+os.environ.setdefault("REQUIRE_AUTH", "false")
+os.environ.setdefault("DB_PATH", os.path.join(tempfile.mkdtemp(prefix="bat-keys-"), "keys.db"))
 
 import pytest
 

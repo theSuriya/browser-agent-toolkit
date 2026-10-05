@@ -67,5 +67,30 @@ class AgentResult(BaseModel):
     transcript: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class KeyCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    name: str = Field(min_length=1, max_length=64)
+    scopes: list[str] = Field(default_factory=list, max_length=10)
+    rate_limit: int | None = Field(default=None, ge=1, le=1_000_000)
+
+
+class KeyCreated(BaseModel):
+    id: str
+    name: str
+    key: str
+    scopes: list[str]
+
+
+class KeyInfo(BaseModel):
+    id: str
+    name: str
+    scopes: list[str]
+    rate_limit: int | None
+    created_at: float
+    revoked: bool
+    last_used: float | None
+
+
 def agent_max_steps() -> int:
     return get_settings().agent_max_steps
