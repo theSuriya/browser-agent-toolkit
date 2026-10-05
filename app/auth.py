@@ -59,7 +59,7 @@ class Principal:
 ANONYMOUS = Principal(
     key_id="local",
     name="local",
-    scopes=frozenset({"admin"}),
+    scopes=frozenset({"admin", "use"}),
     rate_limit=None,
     org_id="local",
     plan_code="enterprise",

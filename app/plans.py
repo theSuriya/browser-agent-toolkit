@@ -6,7 +6,8 @@ session caps, agent step budget, and included metered quotas. It is seeded into 
 for enforcement, so a plan change is one edit here plus a re-seed.
 
 Billing unit is browser-seconds and agent-tasks, never API calls: an API call is a
-routing event that does not map to Chromium memory or CPU.
+routing event that does not map to Chromium memory or CPU. All money fields are in
+integer or fractional cents.
 """
 
 from __future__ import annotations
@@ -59,8 +60,8 @@ PLANS: dict[str, PlanLimits] = {
         included_browser_seconds=300 * _MINUTE,     # 5 browser-hours
         included_agent_tasks=50,
         included_sitechecks=500,
-        overage_cents_per_browser_sec=0.10 / _MINUTE,    # $0.10 per browser-minute
-        overage_cents_per_agent_task=2.0,                # $0.02 per task
+        overage_cents_per_browser_sec=10 / _MINUTE,   # $0.10 per browser-minute
+        overage_cents_per_agent_task=2.0,             # $0.02 per task
     ),
     "team": PlanLimits(
         code="team",
@@ -71,8 +72,8 @@ PLANS: dict[str, PlanLimits] = {
         included_browser_seconds=3000 * _MINUTE,    # 50 browser-hours
         included_agent_tasks=500,
         included_sitechecks=5000,
-        overage_cents_per_browser_sec=0.08 / _MINUTE,    # $0.08 per browser-minute
-        overage_cents_per_agent_task=1.5,
+        overage_cents_per_browser_sec=8 / _MINUTE,    # $0.08 per browser-minute
+        overage_cents_per_agent_task=1.5,             # $0.015 per task
     ),
     "enterprise": PlanLimits(
         code="enterprise",
@@ -83,8 +84,8 @@ PLANS: dict[str, PlanLimits] = {
         included_browser_seconds=100_000_000,
         included_agent_tasks=10_000_000,
         included_sitechecks=10_000_000,
-        overage_cents_per_browser_sec=0.05 / _MINUTE,
-        overage_cents_per_agent_task=1.0,
+        overage_cents_per_browser_sec=5 / _MINUTE,    # $0.05 per browser-minute
+        overage_cents_per_agent_task=1.0,             # $0.01 per task
     ),
 }
 

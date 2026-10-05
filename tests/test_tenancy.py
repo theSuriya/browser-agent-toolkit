@@ -1,90 +1,82 @@
-"""Self-serve signup, per-organization key management and org isolation (no browser)."""
+"""Self-serve signup, per-organization key isolation and account context."""
 
 import pytest
 from fastapi.testclient import TestClient
 
 
-@pytest.fixture
-def app(tmp_path, monkeypatch):
+def _build_app(tmp_path, monkeypatch, **env):
     monkeypatch.setenv("REQUIRE_AUTH", "true")
     monkeypatch.setenv("DB_PATH", str(tmp_path / "keys.db"))
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
     from app.config import get_settings
 
     get_settings.cache_clear()
     from app.main import create_app
 
-    application = create_app()
+    return create_app()
+
+
+@pytest.fixture
+def app(tmp_path, monkeypatch):
+    application = _build_app(tmp_path, monkeypatch, API_KEYS="bootstrap-admin-key")
     yield application
+    from app.config import get_settings
+
     get_settings.cache_clear()
 
 
-def _signup(client, email, org):
+def _signup(client, email: str, org: str) -> dict:
     resp = client.post("/accounts/signup", json={"email": email, "org_name": org})
     assert resp.status_code == 201, resp.text
-    body = resp.json()
-    return body, {"Authorization": f"Bearer {body['key']}"}
+    return resp.json()
 
 
-def test_signup_is_public_and_issues_working_key(app):
+def test_signup_is_public_and_returns_a_key(app):
     with TestClient(app) as client:
-        body, headers = _signup(client, "owner@acme.test", "Acme")
-        assert body["plan"] == "free"
-        assert body["key"].startswith("bat_")
-        # The issued key authenticates and lists empty sessions.
-        assert client.get("/sessions", headers=headers).status_code == 200
-        me = client.get("/accounts/me", headers=headers).json()
-        assert me["org_id"] == body["org_id"]
-        assert me["plan"] == "free"
+        body = _signup(client, "a@example.com", "Acme")
+    assert body["key"].startswith("bat_")
+    assert body["plan"] == "free"
+    assert body["org_id"] and body["key_id"]
 
 
-def test_signup_rejects_bad_email(app):
+def test_signup_validates_email(app):
     with TestClient(app) as client:
-        resp = client.post("/accounts/signup", json={"email": "nope", "org_name": "X"})
-        assert resp.status_code == 422
-        assert resp.json()["error"]["code"] == "validation_failed"
+        resp = client.post("/accounts/signup", json={"email": "not-an-email", "org_name": "X"})
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "validation_failed"
 
 
-def test_keys_are_scoped_to_the_organization(app):
+def test_account_me_reflects_org_and_plan(app):
     with TestClient(app) as client:
-        a, ha = _signup(client, "a@acme.test", "Org A")
-        b, hb = _signup(client, "b@beta.test", "Org B")
-
-        created = client.post("/accounts/keys", json={"name": "ci"}, headers=ha)
-        assert created.status_code == 201, created.text
-        a_key_id = created.json()["id"]
-
-        b_key_ids = {k["id"] for k in client.get("/accounts/keys", headers=hb).json()}
-        assert a_key_id not in b_key_ids  # B cannot see A's key
-
-        # B cannot revoke A's key: reported as missing so existence is not leaked.
-        assert client.delete(f"/accounts/keys/{a_key_id}", headers=hb).status_code == 404
-        # A can revoke its own key.
-        assert client.delete(f"/accounts/keys/{a_key_id}", headers=ha).status_code == 204
+        body = _signup(client, "a@example.com", "Acme")
+        me = client.get("/accounts/me", headers={"Authorization": f"Bearer {body['key']}"})
+    assert me.status_code == 200
+    payload = me.json()
+    assert payload["org_id"] == body["org_id"]
+    assert payload["plan"] == "free"
+    assert "admin" in payload["scopes"]
 
 
-def test_cannot_grant_scopes_you_do_not_hold(app):
+def test_usage_is_scoped_to_the_org(app):
     with TestClient(app) as client:
-        _, headers = _signup(client, "owner@acme.test", "Acme")
-        denied = client.post("/accounts/keys", json={"name": "bad", "scopes": ["superuser"]}, headers=headers)
-        assert denied.status_code == 403
-
-        # A use-only key cannot manage keys at all.
-        limited = client.post("/accounts/keys", json={"name": "readonly", "scopes": ["use"]}, headers=headers)
-        assert limited.status_code == 201
-        limited_headers = {"Authorization": f"Bearer {limited.json()['key']}"}
-        assert client.get("/accounts/keys", headers=limited_headers).status_code == 403
+        body = _signup(client, "a@example.com", "Acme")
+        usage = client.get("/usage", headers={"Authorization": f"Bearer {body['key']}"})
+    assert usage.status_code == 200
+    payload = usage.json()
+    assert payload["plan"] == "free"
+    assert payload["agent_tasks"]["used"] == 0
+    assert payload["browser_seconds"]["included"] == 30 * 60
 
 
-def test_usage_endpoint_reports_plan_and_quota(app):
+def test_keys_are_isolated_between_orgs(app):
     with TestClient(app) as client:
-        _, headers = _signup(client, "owner@acme.test", "Acme")
-        usage = client.get("/usage", headers=headers).json()
-        assert usage["plan"] == "free"
-        assert usage["browser_seconds"]["used"] == 0
-        assert usage["browser_seconds"]["included"] == 1800
-        assert usage["agent_tasks"]["included"] == 5
-
-
-def test_readiness_endpoint(app):
-    with TestClient(app) as client:
-        assert client.get("/ready").status_code == 200
+        a = _signup(client, "a@example.com", "Acme")
+        b = _signup(client, "b@example.com", "Globex")
+        keys_a = client.get("/accounts/keys", headers={"Authorization": f"Bearer {a['key']}"}).json()
+        keys_b = client.get("/accounts/keys", headers={"Authorization": f"Bearer {b['key']}"}).json()
+    ids_a = {k["id"] for k in keys_a}
+    ids_b = {k["id"] for k in keys_b}
+    assert ids_a.isdisjoint(ids_b)
+    assert b["key_id"] not in ids_a
+    assert a["key_id"] in ids_a

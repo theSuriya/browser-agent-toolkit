@@ -17,7 +17,7 @@ from app import repository
 from app.auth import KeyStore
 from app.browser import manager
 from app.config import get_settings
-from app.db import get_sessionmaker, make_engine, make_sessionmaker
+from app.db import make_engine, make_sessionmaker
 from app.errors import register_error_handlers
 from app.mcp_server import build_mcp
 from app.middleware import AccessLogMiddleware, AuthMiddleware, SecurityHeadersMiddleware

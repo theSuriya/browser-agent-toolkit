@@ -160,7 +160,7 @@ async def ensure_bootstrap(
                 org_id=org.id,
                 name="bootstrap",
                 key_hash=digest,
-                scopes=scopes_to_text(["admin"]),
+                scopes=scopes_to_text(["admin", "use"]),
                 rate_limit=rate_limit,
             )
         )

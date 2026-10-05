@@ -10,8 +10,6 @@ Everything here takes an :class:`AsyncSession`; callers own the transaction boun
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.errors import AppError
@@ -87,14 +85,3 @@ async def usage_summary(session: AsyncSession, org_id: str, plan_code: str | Non
         "agent_steps": round(usage.get("agent_steps", 0.0), 3),
         "screenshots": round(usage.get("screenshots", 0.0), 3),
     }
-
-
-@dataclass(frozen=True)
-class PlanContext:
-    """The plan limits resolved for the calling key's organization."""
-
-    plan: PlanLimits
-
-
-async def plan_for(plan_code: str | None) -> PlanContext:
-    return PlanContext(plan=get_plan(plan_code))

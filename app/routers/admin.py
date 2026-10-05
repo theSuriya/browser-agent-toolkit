@@ -2,7 +2,8 @@
 
 from fastapi import APIRouter, Depends, Response, status
 
-from app.auth import KeyStore, Principal, can_grant, get_key_store, require_admin
+from app import repository
+from app.auth import KeyStore, Principal, get_key_store, require_admin
 from app.errors import AppError
 from app.schemas import KeyCreate, KeyCreated, KeyInfo
 
@@ -18,7 +19,7 @@ async def create_key(
     """Mint a key in the caller's organization. The plaintext is returned once."""
     # An admin may not grant a scope they do not hold.
     requested = set(payload.scopes or ["use"])
-    if not can_grant(principal.scopes, requested):
+    if not requested <= principal.scopes:
         raise AppError(403, "forbidden", "You cannot grant scopes you do not hold.")
     plaintext, record = await store.mint(
         payload.name,
@@ -26,7 +27,12 @@ async def create_key(
         rate_limit=payload.rate_limit,
         org_id=principal.org_id,
     )
-    return KeyCreated(id=record.id, name=record.name, key=plaintext, scopes=sorted(record.scopes))
+    return KeyCreated(
+        id=record.id,
+        name=record.name,
+        key=plaintext,
+        scopes=sorted(repository.text_to_scopes(record.scopes)),
+    )
 
 
 @router.get("/keys", response_model=list[KeyInfo])

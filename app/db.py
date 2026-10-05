@@ -12,8 +12,10 @@ development and tests only; production runs Alembic migrations (see ``migrations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import Request
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -22,10 +24,25 @@ class Base(DeclarativeBase):
     """Declarative base for every model."""
 
 
+def _ensure_sqlite_dir(database_url: str) -> None:
+    """Create the parent directory of a SQLite file so a fresh checkout can connect."""
+    url = make_url(database_url)
+    if not url.get_backend_name().startswith("sqlite"):
+        return
+    database = url.database
+    if not database or database == ":memory:":
+        return
+    Path(database).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+
+
 def make_engine(database_url: str) -> AsyncEngine:
     # check_same_thread is a SQLite-only concern; asyncpg ignores unknown args, so
     # only pass it for SQLite URLs.
-    connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
+    if database_url.startswith("sqlite"):
+        _ensure_sqlite_dir(database_url)
+        connect_args = {"check_same_thread": False}
+    else:
+        connect_args = {}
     return create_async_engine(database_url, pool_pre_ping=True, connect_args=connect_args)
 
 
@@ -40,10 +57,6 @@ async def init_models(engine: AsyncEngine) -> None:
 
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
-
-
-def get_sessionmaker(request: Request) -> async_sessionmaker[AsyncSession]:
-    return request.app.state.sessionmaker
 
 
 async def get_session(request: Request) -> AsyncIterator[AsyncSession]:

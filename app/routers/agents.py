@@ -15,13 +15,13 @@ from app.plans import get_plan
 from app.schemas import AgentRequest, AgentResult
 
 router = APIRouter(prefix="/agents", tags=["agents"])
-Session = Annotated[AsyncSession, Depends(get_session)]
+Db = Annotated[AsyncSession, Depends(get_session)]
 
 
 @router.post("/run", response_model=AgentResult)
 async def run_agent_task(
     payload: AgentRequest,
-    db: Session,
+    db: Db,
     principal: Principal = Depends(require_key),
 ) -> AgentResult:
     """Drive a task. Pass ``session_id`` to continue in an existing session (it must

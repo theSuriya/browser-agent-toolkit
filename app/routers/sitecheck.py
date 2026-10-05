@@ -15,13 +15,13 @@ from app.schemas import SiteCheckRequest
 from app.sitecheck import run_site_check
 
 router = APIRouter(prefix="/sitecheck", tags=["sitecheck"])
-Session = Annotated[AsyncSession, Depends(get_session)]
+Db = Annotated[AsyncSession, Depends(get_session)]
 
 
 @router.post("")
 async def check_site(
     payload: SiteCheckRequest,
-    db: Session,
+    db: Db,
     principal: Principal = Depends(require_key),
 ) -> dict:
     """Load a URL in a fresh browser session, run the checks, and close it."""

@@ -6,13 +6,48 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: "8080"
+      # Production state store and shared services (Phase 2 uses Redis for global
+      # rate limiting, the session registry and the job queue).
+      DATABASE_URL: postgresql+asyncpg://bat:bat@postgres:5432/bat
+      REDIS_URL: redis://redis:6379/0
     ports:
       - "8080:8080"
     volumes:
-      - ./data:/app/data
       - ./artifacts:/app/artifacts
     # Chromium needs more than the default 64 MB /dev/shm.
     shm_size: "1gb"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: bat
+      POSTGRES_PASSWORD: bat
+      POSTGRES_DB: bat
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bat -d bat"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
   # Optional: automatic HTTPS in front of the API. Uncomment and set your domain
@@ -30,6 +65,8 @@ services:
   #     - caddy_config:/config
   #   restart: unless-stopped
 
-# volumes:
-#   caddy_data:
-#   caddy_config:
+volumes:
+  pgdata:
+  redisdata:
+  # caddy_data:
+  # caddy_config:

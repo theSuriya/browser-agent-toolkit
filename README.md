@@ -259,7 +259,12 @@ rather than raising, so an agent can re-snapshot and retry.
 | POST | `/agents/run` | run a natural-language task |
 | POST | `/sitecheck` | load a URL and test it |
 | GET | `/tools` | list every tool the agent can call |
+| POST | `/accounts/signup` | self-serve: create a user, org and first key (no key required) |
+| GET | `/accounts/me` | your org, plan, scopes and plan limits |
+| POST/GET/DELETE | `/accounts/keys` | mint / list / revoke keys for your own org |
+| GET | `/usage` | current-month metered usage against the plan quota |
 | GET | `/health` | liveness (no key required) |
+| GET | `/ready` | readiness: the database answers (no key required) |
 
 `POST /agents/run` returns `{ok, result, steps, session_id, transcript}`. The
 `transcript` is the full decision trail (each tool the model chose and the result
@@ -268,10 +273,21 @@ to continue in the same browser; it must belong to your key.
 
 ## Authentication
 
-Every route except `/health` and `/docs` needs `Authorization: Bearer <key>`.
-Keys are stored **hashed** (SHA-256) in a small SQLite database (`DB_PATH`,
-default `data/keys.db`). A single ASGI middleware in front of the app covers both
-the REST routes and the `/mcp` endpoint, so there is one auth path.
+Every route except `/health`, `/ready`, `/docs` and `/accounts/signup` needs
+`Authorization: Bearer <key>`. Keys are stored **hashed** (SHA-256) in the database
+(`DATABASE_URL`, or a SQLite file from `DB_PATH`). A single ASGI middleware in front
+of the app covers both the REST routes and the `/mcp` endpoint, so there is one auth
+path. Keys belong to an **organization**, and the org's plan drives the rate limit,
+session caps, agent step budget and metered quota.
+
+A customer can onboard themselves with no admin in the loop:
+
+```bash
+curl -X POST localhost:8080/accounts/signup \
+  -H 'content-type: application/json' \
+  -d '{"email":"dev@acme.test","org_name":"Acme"}'
+# -> {"org_id":"...","user_id":"...","plan":"free","key":"bat_...","key_id":"..."}  (shown once)
+```
 
 Bootstrap an admin key with `API_KEYS` (comma-separated), then mint customer keys:
 
@@ -289,8 +305,46 @@ curl -X POST localhost:8080/admin/keys \
 | DELETE | `/admin/keys/{id}` | revoke a key (admin scope only) |
 
 Isolation is enforced per key: another key cannot list, drive or close your
-session (the attempt returns `404`, so existence is not leaked). Per-key limits
-are `MAX_SESSIONS_PER_KEY` and `RATE_LIMIT_PER_MIN` (overridable per key).
+session (the attempt returns `404`, so existence is not leaked). Session caps and
+the rate limit come from the org's plan (a per-key `rate_limit` still overrides).
+
+## Multi-tenancy, plans and metering
+
+The service is a multi-tenant product, not just a toolkit. The model is
+`organization → members → api_keys`, and every key inherits its org's plan.
+
+| Plan | Price | Browser-minutes | Agent-tasks | Site checks | Overage |
+|---|---|---|---|---|---|
+| free | $0 | 30 | 5 | 20 | none (hard cap) |
+| developer | $19/mo | 300 | 50 | 500 | $0.10/browser-min, $0.02/task |
+| team | $99/mo | 3000 | 500 | 5000 | $0.08/browser-min, $0.015/task |
+| enterprise | negotiated | large | large | large | $0.05/browser-min, $0.01/task |
+
+The plan catalog lives in `app/plans.py` and is seeded into the `plans` table at
+startup. The billing unit is **browser-seconds and agent-tasks, never API calls**: an
+API call does not map to Chromium cost. Each browser session, agent run, site check
+and screenshot writes a row to `usage_events`; `GET /usage` reports the month's totals
+against the quota. Plans **without** overage are hard-capped (a request over quota
+returns `402 quota_exceeded`); plans **with** overage keep working and accumulate an
+estimated charge. Enforcement happens before the work starts, in
+`app/routers/{browser,agents,sitecheck}.py`.
+
+### Data model and migrations
+
+State lives behind async SQLAlchemy (`app/db.py`, `app/models.py`): organizations,
+users, org_members, api_keys, plans, subscriptions, usage_events, jobs, artifacts and
+audit_log. SQLite is the dev/test default; production uses Postgres. Schema is created
+with `create_all` at startup for development only — production runs Alembic:
+
+```bash
+export DATABASE_URL="postgresql+asyncpg://bat:bat@localhost:5432/bat"
+alembic upgrade head        # run as a release step, before the new version takes traffic
+```
+
+Redis (`REDIS_URL`) is wired into settings for Phase 2 (global rate limiting, the
+external session registry and the job queue); the current build uses the in-process
+limiter. A full ownership-scoped job API (`POST /jobs` → 202) and S3 artifacts are the
+next phase and are not part of this build.
 
 ## Connecting clients
 
@@ -356,13 +410,22 @@ model works. To plug it into another agent framework, register
 
 ```bash
 cp .env.example .env          # set API_KEYS=...
-docker compose up --build     # API on :8080, MCP at /mcp
+docker compose up --build     # API on :8080, Postgres + Redis, MCP at /mcp
 ```
 
-The image installs Chromium with its system libraries and runs as a non-root
-user. Chromium is memory-hungry: allow roughly 1–2 GB per browser and keep
-`MAX_SESSIONS` in step. Put a TLS proxy in front; `deploy/Caddyfile` is a
-ready-to-edit Caddy config that terminates HTTPS for `your-domain/mcp`.
+`docker-compose.yml` brings up the API plus Postgres (state) and Redis (reserved for
+Phase 2 shared services). The API container points at Postgres via `DATABASE_URL`.
+Run migrations as a release step before traffic:
+
+```bash
+docker compose run --rm api alembic upgrade head
+```
+
+For a single-container deploy you can skip Postgres and let the app use its SQLite
+default. The image installs Chromium with its system libraries and runs as a
+non-root user. Chromium is memory-hungry: allow roughly 200–500 MB per browser
+context and keep `MAX_SESSIONS` in step. Put a TLS proxy in front; `deploy/Caddyfile`
+is a ready-to-edit Caddy config that terminates HTTPS for `your-domain/mcp`.
 
 ## Configuration
 
@@ -372,9 +435,14 @@ All settings come from the environment or `.env` (see `.env.example`).
 |---|---|---|
 | `API_KEYS` | — | comma-separated bootstrap admin keys |
 | `REQUIRE_AUTH` | `true` | enforce the bearer key on every route |
-| `DB_PATH` | `data/keys.db` | SQLite file for hashed keys |
-| `RATE_LIMIT_PER_MIN` | `120` | per-key request budget |
-| `MAX_SESSIONS_PER_KEY` | `4` | concurrent browsers per key |
+| `DATABASE_URL` | derived | async DSN (`postgresql+asyncpg://…`); empty = SQLite from `DB_PATH` |
+| `DB_PATH` | `data/keys.db` | SQLite file when `DATABASE_URL` is empty |
+| `DEFAULT_PLAN` | `free` | plan assigned to new self-serve signups |
+| `REDIS_URL` | `redis://localhost:6379/0` | reserved for Phase 2 (global limits, registry, queue) |
+| `STRIPE_SECRET_KEY` | — | optional, until billing is switched on |
+| `STRIPE_WEBHOOK_SECRET` | — | optional, Stripe webhook signing |
+| `RATE_LIMIT_PER_MIN` | `120` | per-key request budget (per-key override wins) |
+| `MAX_SESSIONS_PER_KEY` | `4` | fallback concurrency cap when no plan is set |
 | `MAX_SESSIONS` | `8` | global concurrent browsers |
 | `SESSION_IDLE_SECONDS` | `900` | idle sessions are reaped after this |
 | `HEADLESS` | `true` | run Chromium without a visible window |
@@ -391,10 +459,16 @@ All settings come from the environment or `.env` (see `.env.example`).
 python -m pytest -q
 ```
 
-26 tests run a real Chromium against a local fixture site: the atomic actions,
-the site harness, the agent loop (driven by a scripted fake LLM, so no API key or
-network is needed), and the auth suite (401 without a key, cross-key session
-isolation, revoked keys, rate limiting).
+The suite covers the atomic actions, the site harness, the agent loop (driven by a
+scripted fake LLM, so no API key or network is needed), the auth suite (401 without a
+key, cross-key session isolation, revoked keys, rate limiting), tenancy (self-serve
+signup, per-org key isolation, account context) and metering (usage sums, hard-cap
+`402`, overage estimation). The tenancy, metering and HTTP-contract tests need no
+browser, so they run anywhere:
+
+```bash
+python -m pytest tests/test_api.py tests/test_tenancy.py tests/test_metering.py -q
+```
 
 ## Troubleshooting
 
@@ -425,7 +499,12 @@ does not match `API_KEYS`. Set `REQUIRE_AUTH=false` for local experiments only.
 app/
   config.py      settings (.env)
   errors.py      one JSON error shape
-  auth.py        hashed API keys (SQLite), principals, FastAPI dependencies
+  db.py          async SQLAlchemy engine, session dependency, Base
+  models.py      tenancy, keys, plans, subscriptions, usage, jobs, audit
+  plans.py       plan catalog + enforced limits (rate, sessions, steps, quota)
+  repository.py  owner-scoped data access (keys, tenancy, metering, audit)
+  metering.py    usage events + plan-quota enforcement
+  auth.py        hashed API keys (DB), principals with org + plan, dependencies
   middleware.py  auth + rate limit + security headers + access log (ASGI)
   ratelimit.py   per-key sliding-window limiter
   snapshot.py    in-page JS that builds the ref-addressable snapshot
@@ -437,7 +516,8 @@ app/
   sitecheck.py   the website test harness
   main.py        FastAPI app (mounts the MCP server at /mcp)
   mcp_server.py  MCP server (22 tools, per-key sessions)
-  routers/       browser, agents, sitecheck, admin
+  routers/       browser, agents, sitecheck, accounts, usage, admin
+migrations/      Alembic (0001 initial schema); alembic.ini at the root
 tests/           pytest suite + local fixture site
 examples/        demo.py, run_agent.py, mcp_client.py
 deploy/          Caddyfile (TLS reverse proxy)
