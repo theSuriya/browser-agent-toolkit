@@ -43,6 +43,27 @@ python -m app.mcp_server                # MCP over stdio (Claude Desktop, IDEs)
 MCP_TRANSPORT=streamable-http python -m app.mcp_server   # MCP over HTTP at /mcp
 ```
 
+## See it work (two demos)
+
+Watch the browser get automated, step by step, with a screenshot at each stage
+(written to `artifacts/demo/`):
+
+```bash
+python examples/demo.py                       # scripted: open Wikipedia, search, read
+python examples/demo.py --url https://books.toscrape.com --query "fiction"
+python examples/demo.py --headful             # show the actual window (needs a display)
+```
+
+Drive it with an LLM instead — the model decides the steps:
+
+```bash
+export LLM_API_KEY=sk-...
+python examples/demo.py --mode agent \
+  --task "Go to https://en.wikipedia.org, search for 'browser automation', and summarize the first paragraph"
+```
+
+The same task can be run through the REST API (`POST /agents/run`).
+
 ## REST API
 
 | Method | Path | Purpose |
