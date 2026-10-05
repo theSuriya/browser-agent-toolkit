@@ -1,7 +1,8 @@
-"""FastAPI application: sessions, agent runs, site checks, admin keys, health.
+"""FastAPI application: sessions, agent runs, site checks, accounts, admin keys, health.
 
 The MCP server is mounted at ``/mcp`` so a single auth middleware protects both the
-REST API and the MCP HTTP endpoint.
+REST API and the MCP HTTP endpoint. All persisted state (tenancy, keys, metering,
+jobs) lives behind the async SQLAlchemy layer in ``app/db.py``.
 """
 
 import asyncio
@@ -12,14 +13,16 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app import repository
 from app.auth import KeyStore
 from app.browser import manager
 from app.config import get_settings
+from app.db import get_sessionmaker, make_engine, make_sessionmaker
 from app.errors import register_error_handlers
 from app.mcp_server import build_mcp
 from app.middleware import AccessLogMiddleware, AuthMiddleware, SecurityHeadersMiddleware
 from app.ratelimit import SlidingWindowLimiter
-from app.routers import admin, agents, browser, sitecheck
+from app.routers import accounts, admin, agents, browser, sitecheck, usage
 from app.tools import TOOL_SPECS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -44,6 +47,14 @@ async def _reaper() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     reaper = asyncio.create_task(_reaper())
+    factory = app.state.sessionmaker
+    # Development/test schema bootstrap. Production uses Alembic instead.
+    from app.db import init_models
+
+    await init_models(app.state.engine)
+    async with factory() as session:
+        await repository.seed_plans(session)
+    await app.state.key_store.ensure_bootstrap(app.state.settings.bootstrap_keys)
     try:
         # The MCP streamable-http transport needs its session manager running for the
         # lifetime of the app. It may be started only once per instance, so a second
@@ -59,14 +70,20 @@ async def lifespan(app: FastAPI):
         with contextlib.suppress(asyncio.CancelledError):
             await reaper
         await manager.stop()
+        await app.state.engine.dispose()
 
 
 def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(title=settings.app_name, version="1.0.0", lifespan=lifespan)
 
-    store = KeyStore(settings.db_path)
-    store.ensure_bootstrap(settings.bootstrap_keys)
+    engine = make_engine(settings.effective_database_url)
+    sessionmaker = make_sessionmaker(engine)
+    store = KeyStore(sessionmaker)
+
+    app.state.settings = settings
+    app.state.engine = engine
+    app.state.sessionmaker = sessionmaker
     app.state.key_store = store
     app.state.limiter = SlidingWindowLimiter()
 
@@ -87,10 +104,12 @@ def create_app() -> FastAPI:
     )
 
     register_error_handlers(app)
+    app.include_router(accounts.router)
     app.include_router(admin.router)
     app.include_router(browser.router)
     app.include_router(agents.router)
     app.include_router(sitecheck.router)
+    app.include_router(usage.router)
 
     # Build a per-app MCP server: its streamable-http session manager can only be
     # started once, so each app (and each test) needs its own instance.
@@ -108,6 +127,15 @@ def create_app() -> FastAPI:
     @app.get("/health", tags=["meta"])
     async def health() -> dict:
         return {"status": "ok", "sessions": manager.session_count, "auth": settings.require_auth}
+
+    @app.get("/ready", tags=["meta"])
+    async def ready() -> dict:
+        """Readiness: the database answers."""
+        from sqlalchemy import text
+
+        async with app.state.sessionmaker() as session:
+            await session.execute(text("SELECT 1"))
+        return {"status": "ready"}
 
     @app.get("/tools", tags=["meta"])
     async def tools() -> dict:

@@ -7,6 +7,15 @@ playwright==1.49.1
 mcp==1.12.4
 python-dotenv==1.0.1
 
+# Persistence: tenancy, keys, metering, jobs (SQLite for dev, Postgres in production)
+sqlalchemy[asyncio]==2.0.36
+aiosqlite==0.20.0
+asyncpg==0.30.0
+alembic==1.14.0
+
+# Shared services (Phase 2: global rate limiting, session registry, queues)
+redis==5.2.1
+
 # tests
 pytest==8.3.4
 pytest-asyncio==0.25.0

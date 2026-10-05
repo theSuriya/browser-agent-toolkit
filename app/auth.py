@@ -1,28 +1,27 @@
-"""API-key authentication.
+"""API-key authentication backed by the database.
 
 Keys are stored only as SHA-256 hashes; the plaintext is shown once, at creation.
-An in-memory index makes verification a dictionary lookup (no I/O per request),
-while SQLite provides persistence across restarts.
+Verification reads the ``api_keys`` table (persisting ``last_used`` so usage survives
+restarts) and resolves the owning organization's plan, which the request pipeline uses
+to enforce rate limits, session caps and quotas.
 
-The authenticated caller is represented by a :class:`Principal`. Middleware sets
-it for the current request (so both the REST routes and the mounted MCP endpoint
-see the same identity); the FastAPI dependencies here read it back.
+The authenticated caller is a :class:`Principal`. Middleware sets it for the current
+request (so both the REST routes and the mounted MCP endpoint see the same identity);
+the FastAPI dependencies here read it back.
 """
 
-import hashlib
-import secrets
-import sqlite3
-import threading
-import time
+from __future__ import annotations
+
 from contextvars import ContextVar
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
 
 from fastapi import Depends, Request
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app import repository
 from app.config import get_settings
 from app.errors import AppError
+from app.plans import get_plan
 
 
 @dataclass(frozen=True)
@@ -31,15 +30,42 @@ class Principal:
     name: str
     scopes: frozenset[str]
     rate_limit: int | None = None
+    org_id: str = "local"
+    plan_code: str = "free"
+    max_sessions_per_key: int = 4
+    max_agent_steps: int = 25
 
     @property
     def is_admin(self) -> bool:
         return "admin" in self.scopes
 
+    @classmethod
+    def from_key(cls, record, plan_code: str) -> "Principal":
+        plan = get_plan(plan_code)
+        return cls(
+            key_id=record.id,
+            name=record.name,
+            scopes=repository.text_to_scopes(record.scopes),
+            rate_limit=record.rate_limit,
+            org_id=record.org_id,
+            plan_code=plan.code,
+            max_sessions_per_key=plan.max_sessions_per_key,
+            max_agent_steps=plan.max_agent_steps,
+        )
 
-# Used only when REQUIRE_AUTH is off (local development and tests). It is an
-# admin so every endpoint is reachable without a key.
-ANONYMOUS = Principal(key_id="local", name="local", scopes=frozenset({"admin"}), rate_limit=None)
+
+# Used only when REQUIRE_AUTH is off (local development and tests). It is an admin
+# with the enterprise plan so every endpoint is reachable and effectively uncapped.
+ANONYMOUS = Principal(
+    key_id="local",
+    name="local",
+    scopes=frozenset({"admin"}),
+    rate_limit=None,
+    org_id="local",
+    plan_code="enterprise",
+    max_sessions_per_key=100,
+    max_agent_steps=100,
+)
 
 _current_principal: ContextVar[Principal | None] = ContextVar("current_principal", default=None)
 
@@ -56,172 +82,87 @@ def get_current_principal() -> Principal | None:
     return _current_principal.get()
 
 
-def _hash(key: str) -> str:
-    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+# A scope grants the scopes it implies: "admin" also carries "use".
+_SCOPE_IMPLIES: dict[str, set[str]] = {"admin": {"admin", "use"}}
+
+# Every scope a caller may hand out, given the scopes they hold.
+_SCOPE_CEILING: frozenset[str] = frozenset({"admin", "use"})
 
 
-@dataclass
-class KeyRecord:
-    id: str
-    name: str
-    key_hash: str
-    scopes: frozenset[str]
-    rate_limit: int | None
-    created_at: float
-    revoked: bool = False
-    last_used: float | None = None
+def can_grant(caller_scopes: frozenset[str], requested: set[str]) -> bool:
+    """True when a caller holding ``caller_scopes`` may grant ``requested``."""
+    if not requested <= _SCOPE_CEILING:
+        return False
+    expanded: set[str] = set()
+    for scope in caller_scopes:
+        expanded |= _SCOPE_IMPLIES.get(scope, {scope})
+    return requested <= expanded
 
 
 class KeyStore:
-    """SQLite-backed store of hashed API keys with an in-memory index."""
+    """Database-backed key store. Holds a session factory so middleware can use it."""
 
-    def __init__(self, db_path: str) -> None:
-        self._db_path = db_path
-        self._by_hash: dict[str, KeyRecord] = {}
-        self._by_id: dict[str, KeyRecord] = {}
-        self._lock = threading.Lock()
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
-        self._load()
+    def __init__(self, sessionmaker: async_sessionmaker[AsyncSession]) -> None:
+        self._sessionmaker = sessionmaker
 
-    # -- persistence -------------------------------------------------------
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path, timeout=5)
-        conn.row_factory = sqlite3.Row
-        return conn
+    def _session(self) -> AsyncSession:
+        return self._sessionmaker()
 
-    def _init_db(self) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS api_keys (
-                    id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    key_hash TEXT NOT NULL UNIQUE,
-                    scopes TEXT NOT NULL,
-                    rate_limit INTEGER,
-                    created_at REAL NOT NULL,
-                    revoked INTEGER NOT NULL DEFAULT 0
-                )
-                """
-            )
-
-    def _load(self) -> None:
-        with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM api_keys").fetchall()
-        for row in rows:
-            record = KeyRecord(
-                id=row["id"],
-                name=row["name"],
-                key_hash=row["key_hash"],
-                scopes=frozenset(s for s in row["scopes"].split(",") if s),
-                rate_limit=row["rate_limit"],
-                created_at=row["created_at"],
-                revoked=bool(row["revoked"]),
-            )
-            self._by_hash[record.key_hash] = record
-            self._by_id[record.id] = record
-
-    def _insert(self, record: KeyRecord) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO api_keys (id, name, key_hash, scopes, rate_limit, created_at, revoked)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    record.id,
-                    record.name,
-                    record.key_hash,
-                    ",".join(sorted(record.scopes)),
-                    record.rate_limit,
-                    record.created_at,
-                    int(record.revoked),
-                ),
-            )
-
-    def _set_revoked(self, key_id: str, revoked: bool) -> None:
-        with self._connect() as conn:
-            conn.execute("UPDATE api_keys SET revoked = ? WHERE id = ?", (int(revoked), key_id))
-
-    # -- api ---------------------------------------------------------------
-    def ensure_bootstrap(self, keys: list[str]) -> int:
-        """Insert any bootstrap keys that are not already present. Returns the count added."""
-        added = 0
-        with self._lock:
-            for key in keys:
-                if not key:
-                    continue
-                key_hash = _hash(key)
-                if key_hash in self._by_hash:
-                    continue
-                record = KeyRecord(
-                    id=secrets.token_hex(8),
-                    name="bootstrap",
-                    key_hash=key_hash,
-                    scopes=frozenset({"admin"}),
-                    rate_limit=None,
-                    created_at=time.time(),
-                )
-                self._insert(record)
-                self._by_hash[key_hash] = record
-                self._by_id[record.id] = record
-                added += 1
-        return added
-
-    def verify(self, api_key: str) -> Principal | None:
-        record = self._by_hash.get(_hash(api_key))
-        if record is None or record.revoked:
+    async def verify(self, api_key: str | None) -> Principal | None:
+        if not api_key:
             return None
-        record.last_used = time.time()
-        return Principal(
-            key_id=record.id,
-            name=record.name,
-            scopes=record.scopes,
-            rate_limit=record.rate_limit,
-        )
+        async with self._session() as session:
+            resolved = await repository.authenticate_key(session, api_key)
+        if resolved is None:
+            return None
+        record, plan_code = resolved
+        return Principal.from_key(record, plan_code)
 
-    def mint(
+    async def ensure_bootstrap(self, keys: list[str]) -> str:
+        """Idempotently create the bootstrap org + keys; returns the org id."""
+        async with self._session() as session:
+            org = await repository.ensure_bootstrap(
+                session, keys, rate_limit=get_settings().rate_limit_per_min
+            )
+            return org.id
+
+    async def bootstrap_org_id(self) -> str:
+        return await self.ensure_bootstrap([])
+
+    async def mint(
         self,
         name: str,
         scopes: list[str] | None = None,
         rate_limit: int | None = None,
-    ) -> tuple[str, KeyRecord]:
+        org_id: str | None = None,
+    ) -> tuple[str, repository.ApiKey]:
         """Create a key. Returns ``(plaintext, record)``; the plaintext is not stored."""
-        plaintext = "bat_" + secrets.token_urlsafe(32)
-        record = KeyRecord(
-            id=secrets.token_hex(8),
-            name=name,
-            key_hash=_hash(plaintext),
-            scopes=frozenset(scopes or ["use"]),
-            rate_limit=rate_limit,
-            created_at=time.time(),
-        )
-        with self._lock:
-            self._insert(record)
-            self._by_hash[record.key_hash] = record
-            self._by_id[record.id] = record
-        return plaintext, record
+        async with self._session() as session:
+            if org_id is None:
+                org = await repository.ensure_bootstrap(session, [])
+                org_id = org.id
+            plaintext, record = await repository.create_api_key(
+                session, org_id, name, scopes=scopes, rate_limit=rate_limit
+            )
+            await session.commit()
+            return plaintext, record
 
-    def revoke(self, key_id: str) -> bool:
-        with self._lock:
-            record = self._by_id.get(key_id)
-            if record is None:
-                return False
-            record.revoked = True
-            self._set_revoked(key_id, True)
-            return True
+    async def revoke(self, org_id: str, key_id: str) -> bool:
+        async with self._session() as session:
+            return await repository.revoke_key(session, org_id, key_id)
 
-    def list_public(self) -> list[dict[str, Any]]:
-        with self._lock:
-            records = sorted(self._by_id.values(), key=lambda r: r.created_at)
+    async def list_public(self, org_id: str) -> list[dict]:
+        async with self._session() as session:
+            records = await repository.list_keys(session, org_id)
             return [
                 {
                     "id": r.id,
                     "name": r.name,
-                    "scopes": sorted(r.scopes),
+                    "scopes": sorted(repository.text_to_scopes(r.scopes)),
                     "rate_limit": r.rate_limit,
-                    "created_at": r.created_at,
+                    "created_at": r.created_at.timestamp(),
                     "revoked": r.revoked,
-                    "last_used": r.last_used,
+                    "last_used": r.last_used.timestamp() if r.last_used else None,
                 }
                 for r in records
             ]
@@ -252,7 +193,7 @@ async def require_key(request: Request) -> Principal:
         return principal
     raw = _bearer(request)
     if raw:
-        resolved = get_key_store(request).verify(raw)
+        resolved = await get_key_store(request).verify(raw)
         if resolved is not None:
             return resolved
     if not get_settings().require_auth:

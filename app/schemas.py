@@ -92,5 +92,52 @@ class KeyInfo(BaseModel):
     last_used: float | None
 
 
+# -- Tenancy / self-serve ---------------------------------------------------
+class SignupRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    email: str = Field(
+        min_length=3,
+        max_length=320,
+        pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
+    )
+    org_name: str = Field(min_length=1, max_length=200)
+
+
+class SignupResponse(BaseModel):
+    org_id: str
+    user_id: str
+    plan: str
+    key: str  # shown once
+    key_id: str
+
+
+class AccountInfo(BaseModel):
+    org_id: str
+    plan: str
+    key_id: str
+    key_name: str
+    scopes: list[str]
+    max_sessions_per_key: int
+    max_agent_steps: int
+
+
+class UsageBucket(BaseModel):
+    used: float
+    included: int
+    remaining: float | None
+    overage_cents: float
+
+
+class UsageSummary(BaseModel):
+    plan: str
+    period_start: str
+    browser_seconds: UsageBucket
+    agent_tasks: UsageBucket
+    sitechecks: UsageBucket
+    agent_steps: float
+    screenshots: float
+
+
 def agent_max_steps() -> int:
     return get_settings().agent_max_steps

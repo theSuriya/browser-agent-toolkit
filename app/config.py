@@ -18,9 +18,19 @@ class Settings(BaseSettings):
     require_auth: bool = True
     api_keys: str = ""  # comma-separated bootstrap keys, each granted the admin scope
     db_path: str = "data/keys.db"
+    # Full DSN. Empty means "derive a SQLite DSN from DB_PATH" (dev and tests).
+    database_url: str = ""
     rate_limit_per_min: int = 120
     max_sessions_per_key: int = 4
     mcp_http_path: str = "/mcp"
+    default_plan: str = "free"
+
+    # Shared services (Phase 2: global rate limiting, session registry, queues)
+    redis_url: str = "redis://localhost:6379/0"
+
+    # Billing (Stripe). Optional until billing is switched on.
+    stripe_secret_key: str = ""
+    stripe_webhook_secret: str = ""
 
     # Browser
     browser_type: str = "chromium"
@@ -45,6 +55,13 @@ class Settings(BaseSettings):
     def bootstrap_keys(self) -> list[str]:
         """Bootstrap admin keys, parsed from the comma-separated ``API_KEYS`` value."""
         return [key.strip() for key in self.api_keys.split(",") if key.strip()]
+
+    @property
+    def effective_database_url(self) -> str:
+        """The DSN to use: an explicit ``DATABASE_URL`` or a SQLite file from ``DB_PATH``."""
+        if self.database_url:
+            return self.database_url
+        return f"sqlite+aiosqlite:///{self.db_path}"
 
 
 @lru_cache
