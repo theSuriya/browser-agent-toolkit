@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Good Site</title>
+  </head>
+  <body>
+    <h1>Product Catalog</h1>
+    <img
+      alt="logo"
+      src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw=="
+    />
+    <form>
+      <label for="q">Search</label>
+      <input id="q" name="q" type="text" />
+      <button type="button" id="go">Search</button>
+    </form>
+    <p id="out"></p>
+    <a href="page2.html">Second page</a>
+    <script>
+      document.getElementById("go").addEventListener("click", () => {
+        document.getElementById("out").textContent =
+          "hello " + document.getElementById("q").value;
+      });
+    </script>
+  </body>
+</html>
