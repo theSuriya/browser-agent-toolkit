@@ -100,8 +100,9 @@ class BrowserManager:
     def owned_count(self, owner: str) -> int:
         return sum(1 for s in self._sessions.values() if s.owner == owner)
 
-    async def create_session(self, owner: str = "local") -> Session:
+    async def create_session(self, owner: str = "local", max_per_owner: int | None = None) -> Session:
         settings = get_settings()
+        per_owner_limit = max_per_owner if max_per_owner is not None else settings.max_sessions_per_key
         await self.start()
         await self.reap_idle()
         if len(self._sessions) >= settings.max_sessions:
@@ -110,11 +111,11 @@ class BrowserManager:
                 "too_many_sessions",
                 f"Session limit ({settings.max_sessions}) reached. Close a session first.",
             )
-        if self.owned_count(owner) >= settings.max_sessions_per_key:
+        if self.owned_count(owner) >= per_owner_limit:
             raise AppError(
                 429,
                 "too_many_sessions",
-                f"Session limit per key ({settings.max_sessions_per_key}) reached. Close a session first.",
+                f"Session limit per key ({per_owner_limit}) reached. Close a session first.",
             )
         assert self._browser is not None
         context = await self._browser.new_context(

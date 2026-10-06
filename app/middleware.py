@@ -12,11 +12,12 @@ import uuid
 from app.auth import KeyStore, reset_current_principal, set_current_principal
 from app.config import Settings
 from app.errors import error_body
-from app.ratelimit import SlidingWindowLimiter
+from app.plans import get_plan
+from app.ratelimit import RateLimiter
 
 logger = logging.getLogger("app.access")
 
-_PUBLIC_PATHS = {"/health", "/docs", "/redoc", "/openapi.json", "/favicon.ico"}
+_PUBLIC_PATHS = {"/health", "/ready", "/docs", "/redoc", "/openapi.json", "/favicon.ico", "/accounts/signup"}
 
 
 def _header(scope, name: bytes) -> str | None:
@@ -29,7 +30,7 @@ def _header(scope, name: bytes) -> str | None:
 class AuthMiddleware:
     """Authenticate the bearer token, apply the rate limit, and set the principal."""
 
-    def __init__(self, app, *, settings: Settings, store: KeyStore, limiter: SlidingWindowLimiter) -> None:
+    def __init__(self, app, *, settings: Settings, store: KeyStore, limiter: RateLimiter) -> None:
         self.app = app
         self.settings = settings
         self.store = store
@@ -45,6 +46,7 @@ class AuthMiddleware:
             or not self.settings.require_auth
             or path in _PUBLIC_PATHS
             or path.startswith("/docs")
+            or path.startswith("/artifacts/")
         ):
             return await self.app(scope, receive, send)
 
@@ -55,15 +57,16 @@ class AuthMiddleware:
             if len(parts) == 2 and parts[0].lower() == "bearer":
                 token = parts[1].strip()
 
-        principal = self.store.verify(token) if token else None
+        principal = await self.store.verify(token) if token else None
         if principal is None:
             return await self._send(
                 send, 401, "unauthenticated",
                 "Provide a valid API key: Authorization: Bearer <key>.",
             )
 
-        limit = principal.rate_limit or self.settings.rate_limit_per_min
-        if not self.limiter.check(principal.key_id, limit):
+        # A key-level override wins; otherwise the plan's rate limit applies.
+        limit = principal.rate_limit or get_plan(principal.plan_code).rate_limit_per_min
+        if not await self.limiter.check(principal.key_id, limit):
             return await self._send(
                 send, 429, "rate_limited",
                 f"Rate limit of {limit} requests per minute exceeded.",

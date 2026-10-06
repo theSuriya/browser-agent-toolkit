@@ -3,6 +3,7 @@ __pycache__/
 .env
 .venv/
 artifacts/
+data/
 .pytest_cache/
 *.db
 myvenv/

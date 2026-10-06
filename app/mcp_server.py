@@ -38,13 +38,15 @@ def _owner() -> str:
 
 async def _current_session() -> Session:
     owner = _owner()
+    principal = get_current_principal()
+    max_per_owner = principal.max_sessions_per_key if principal is not None else None
     session = _sessions.get(owner)
     if session is not None:
         try:
             return manager.get(session.id, owner=owner)
         except AppError:
             _sessions.pop(owner, None)
-    session = await manager.create_session(owner=owner)
+    session = await manager.create_session(owner=owner, max_per_owner=max_per_owner)
     _sessions[owner] = session
     return session
 
