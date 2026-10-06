@@ -7,11 +7,12 @@ Chromium) and tests websites. It is **not** a web app: it is a service/library.
 ## Commands
 - Install: `pip install -r requirements.txt && python -m playwright install chromium`
 - Run REST API: `uvicorn app.main:app --port 8080`
+- Run a dedicated job worker: `python -m app.worker`
 - Run MCP (stdio): `python -m app.mcp_server`
 - Run MCP (HTTP): `MCP_TRANSPORT=streamable-http python -m app.mcp_server`
 - Tests: `python -m pytest -q`
-- Browser-free tests (run anywhere): `python -m pytest tests/test_api.py tests/test_tenancy.py tests/test_metering.py -q`
-- Compile check: `python -m compileall app tests`
+- Browser-free tests (run anywhere): `python -m pytest tests/test_api.py tests/test_tenancy.py tests/test_metering.py tests/test_ratelimit.py tests/test_queue.py tests/test_storage.py tests/test_registry.py tests/test_jobs.py -q`
+- Compile check: `python -m compileall app tests migrations`
 - Migrations (production): `alembic upgrade head` with `DATABASE_URL` set to a Postgres DSN
 
 ## Architecture
@@ -46,8 +47,30 @@ Chromium) and tests websites. It is **not** a web app: it is a service/library.
   work, meter after (browser-seconds, agent-tasks, agent-steps, sitecheck, screenshots).
 - Auth/middleware is async now: `KeyStore.verify` is `await`ed in `AuthMiddleware`;
   the key-level `rate_limit` still overrides the plan's.
-- Redis (`REDIS_URL`) is in settings for Phase 2 (global rate limiting, session
-  registry, job queue); NOT used yet. Async job API + S3 artifacts are not built.
+
+## Async jobs, worker and shared services (Phase 2)
+- `POST /jobs` (202 {id}), `GET /jobs`, `GET /jobs/{id}` — async job API in
+  `app/routers/jobs.py`. It validates the payload with the existing `AgentRequest`/
+  `SiteCheckRequest` models, checks quota, writes a `jobs` row and enqueues an envelope.
+- `app/worker.py` (`python -m app.worker`) consumes the queue: per-tenant fairness
+  (defers a job when an org is at `JOBS_MAX_CONCURRENT_PER_ORG`), retries a crashed job
+  once (`JOB_MAX_ATTEMPTS`), meters its usage, and fires an HMAC-signed webhook
+  (`X-BAT-Signature`) on terminal state. `Worker.executor` is injectable (tests pass fakes).
+- `app/jobs.py` = job persistence, status transitions (`mark_running`/`mark_finished`),
+  `envelope`, lease-based `reap_stale`, and `deliver_webhook`.
+- Redis-backed services, all falling back to in-process when `REDIS_URL` is empty:
+  `app/cache.py` (`make_redis`), `app/ratelimit.py` (`RedisSlidingWindowLimiter` +
+  `build_limiter`), `app/queue.py` (`RedisJobQueue`/`InProcessJobQueue`),
+  `app/registry.py` (`SessionRegistry`, worker attribution for live sessions).
+- `app/storage.py` = artifact store: `S3ArtifactStore` (presigned) or
+  `LocalArtifactStore` (HMAC-signed expiring URLs, path-traversal guarded); served by
+  `GET /artifacts/{key}` (public path, signature-gated). `build_store` picks by `S3_BUCKET`.
+- `app/main.py` wires limiter/queue/registry/store into `app.state`, runs an inline worker
+  when `RUN_INLINE_WORKER` (default true), reaps stale jobs, and `/ready` reports database
+  and redis. `docker-compose.yml` has a dedicated `worker` service (`--scale worker=N`).
+- Migration `0002_phase2_jobs` adds `jobs.attempts/worker_id/started_at`.
+- Tests use `fakeredis` (in-process) and a real `redis` client against a fakeredis TCP
+  server for the live check; no Redis server or browser needed.
 
 ## Conventions
 - Python 3.10+, type hints, pydantic v2 for all I/O, one error shape
@@ -76,6 +99,10 @@ Chromium) and tests websites. It is **not** a web app: it is a service/library.
   network/API key is needed.
 - `tests/test_tenancy.py` (signup, per-org key isolation) and `tests/test_metering.py`
   (usage sums, hard-cap 402, overage estimation) need no browser and run in any sandbox.
+- Browser-free Phase 2 suites: `tests/test_ratelimit.py`, `tests/test_queue.py`,
+  `tests/test_storage.py`, `tests/test_registry.py` (fakeredis) and `tests/test_jobs.py`
+  (202 contract, org isolation, 422, worker success + usage + webhook, retry-once,
+  terminal failure, webhook signing) — no Redis server or browser required.
 - The sandbox here has no Chromium OS libraries (`playwright install --with-deps` is
   forbidden by convention), so browser tests are skipped/failed locally — that is
   environmental, not a code failure. Run them on a host with the libs.

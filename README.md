@@ -263,8 +263,12 @@ rather than raising, so an agent can re-snapshot and retry.
 | GET | `/accounts/me` | your org, plan, scopes and plan limits |
 | POST/GET/DELETE | `/accounts/keys` | mint / list / revoke keys for your own org |
 | GET | `/usage` | current-month metered usage against the plan quota |
+| POST | `/jobs` | enqueue async work (`agent` or `sitecheck`) → `202 {id}` |
+| GET | `/jobs` | list your org's jobs (paginated) |
+| GET | `/jobs/{id}` | poll one job: status, result, error |
+| GET | `/artifacts/{key}` | fetch a screenshot/artifact via a signed, expiring URL |
 | GET | `/health` | liveness (no key required) |
-| GET | `/ready` | readiness: the database answers (no key required) |
+| GET | `/ready` | readiness: database and Redis answer (no key required) |
 
 `POST /agents/run` returns `{ok, result, steps, session_id, transcript}`. The
 `transcript` is the full decision trail (each tool the model chose and the result
@@ -341,10 +345,53 @@ export DATABASE_URL="postgresql+asyncpg://bat:bat@localhost:5432/bat"
 alembic upgrade head        # run as a release step, before the new version takes traffic
 ```
 
-Redis (`REDIS_URL`) is wired into settings for Phase 2 (global rate limiting, the
-external session registry and the job queue); the current build uses the in-process
-limiter. A full ownership-scoped job API (`POST /jobs` → 202) and S3 artifacts are the
-next phase and are not part of this build.
+## Async jobs and the worker
+
+Long tasks do not hold an HTTP connection. `POST /jobs` validates the payload with the
+same schema as the sync route, checks the plan quota, writes a `jobs` row and enqueues an
+envelope — returning `202 Accepted` with the job id. A worker consumes the queue, runs the
+job with per-tenant fairness, meters its usage and transitions the row to `succeeded` or
+`failed`, firing an HMAC-signed webhook on completion.
+
+```bash
+# enqueue a site check
+curl -X POST localhost:8080/jobs -H 'Authorization: Bearer bat_...' \
+  -H 'content-type: application/json' \
+  -d '{"kind":"sitecheck","input":{"url":"http://localhost:3000"},"callback_url":"https://your.app/hooks/bat"}'
+# -> 202 {"id":"...","kind":"sitecheck","status":"queued",...}
+
+curl -s localhost:8080/jobs/<id> -H 'Authorization: Bearer bat_...'
+# -> {"id":"...","status":"running"|"succeeded"|"failed","result":{...},"error":null}
+```
+
+A job whose worker crashes is retried once (`JOB_MAX_ATTEMPTS`); a row stuck `running`
+past its lease (`JOB_LEASE_SECONDS`) is requeued. Webhooks carry `X-BAT-Signature`, an
+HMAC-SHA256 of the body with `WEBHOOK_SIGNING_SECRET`.
+
+## Scaling out (Redis)
+
+With `REDIS_URL` set, three things become global instead of per-process:
+
+- **Rate limiting** — `RedisSlidingWindowLimiter` (a Redis sorted set) enforces one limit
+  across every API instance, and degrades to the in-process window if Redis is unreachable.
+- **The job queue** — `RedisJobQueue` lets any number of worker processes pull work.
+- **The session registry** — `SessionRegistry` records which worker owns each live session.
+
+Run dedicated workers and scale them independently:
+
+```bash
+# API instances: no inline worker
+RUN_INLINE_WORKER=false uvicorn app.main:app --port 8080
+# Worker processes
+python -m app.worker
+# or with Compose:
+docker compose up --scale worker=3
+```
+
+With `REDIS_URL` empty the app falls back to the single-process limiter, the in-process
+queue and an inline worker, so a fresh clone runs with no Redis. Artifacts go to local
+disk with signed expiring URLs (`LocalArtifactStore`) or to S3 with presigned URLs
+(`S3ArtifactStore`) when `S3_BUCKET` is set. `/ready` reports `database` and `redis`.
 
 ## Connecting clients
 
@@ -413,8 +460,10 @@ cp .env.example .env          # set API_KEYS=...
 docker compose up --build     # API on :8080, Postgres + Redis, MCP at /mcp
 ```
 
-`docker-compose.yml` brings up the API plus Postgres (state) and Redis (reserved for
-Phase 2 shared services). The API container points at Postgres via `DATABASE_URL`.
+`docker-compose.yml` brings up the API, a dedicated worker (`python -m app.worker`), plus
+Postgres (state) and Redis (shared rate limit, job queue, session registry). The API
+container points at Postgres via `DATABASE_URL` and runs with `RUN_INLINE_WORKER=false`.
+Scale the worker tier independently with `docker compose up --scale worker=3`.
 Run migrations as a release step before traffic:
 
 ```bash
@@ -438,7 +487,17 @@ All settings come from the environment or `.env` (see `.env.example`).
 | `DATABASE_URL` | derived | async DSN (`postgresql+asyncpg://…`); empty = SQLite from `DB_PATH` |
 | `DB_PATH` | `data/keys.db` | SQLite file when `DATABASE_URL` is empty |
 | `DEFAULT_PLAN` | `free` | plan assigned to new self-serve signups |
-| `REDIS_URL` | `redis://localhost:6379/0` | reserved for Phase 2 (global limits, registry, queue) |
+| `REDIS_URL` | `redis://localhost:6379/0` | global rate limit, job queue, session registry (empty = in-process) |
+| `RUN_INLINE_WORKER` | `true` | run a worker inside the API process (set `false` with dedicated workers) |
+| `JOBS_MAX_CONCURRENT_PER_ORG` | `2` | per-tenant fairness cap in the worker |
+| `JOB_MAX_ATTEMPTS` | `2` | a crashed job is retried once before it fails |
+| `JOB_LEASE_SECONDS` | `300` | requeue jobs stuck `running` past this |
+| `WEBHOOK_SIGNING_SECRET` | — | HMAC-SHA256 key for `X-BAT-Signature` on webhooks |
+| `S3_BUCKET` / `S3_REGION` / `S3_ENDPOINT_URL` | — | S3 artifacts; empty = local disk with signed URLs |
+| `ARTIFACT_BASE_URL` | `http://localhost:8080` | base for local signed artifact URLs |
+| `ARTIFACT_SIGNING_SECRET` | — | required for local signed URLs in production |
+| `ARTIFACT_TTL_SECONDS` | `3600` | artifact URL lifetime |
+| `SESSION_REGISTRY_TTL_SECONDS` | `1800` | session-registry entry TTL |
 | `STRIPE_SECRET_KEY` | — | optional, until billing is switched on |
 | `STRIPE_WEBHOOK_SECRET` | — | optional, Stripe webhook signing |
 | `RATE_LIMIT_PER_MIN` | `120` | per-key request budget (per-key override wins) |
@@ -462,12 +521,18 @@ python -m pytest -q
 The suite covers the atomic actions, the site harness, the agent loop (driven by a
 scripted fake LLM, so no API key or network is needed), the auth suite (401 without a
 key, cross-key session isolation, revoked keys, rate limiting), tenancy (self-serve
-signup, per-org key isolation, account context) and metering (usage sums, hard-cap
-`402`, overage estimation). The tenancy, metering and HTTP-contract tests need no
-browser, so they run anywhere:
+signup, per-org key isolation, account context), metering (usage sums, hard-cap `402`,
+overage estimation) and the Phase 2 shared services (Redis limiter, queue, session
+registry, signed artifact store) plus the async job API and worker (202 contract, org
+isolation, retry-once, webhook delivery and signing).
+
+Those shared-service and job tests use `fakeredis`, so no server or browser is needed and
+they run anywhere:
 
 ```bash
-python -m pytest tests/test_api.py tests/test_tenancy.py tests/test_metering.py -q
+python -m pytest tests/test_api.py tests/test_tenancy.py tests/test_metering.py \
+  tests/test_ratelimit.py tests/test_queue.py tests/test_storage.py \
+  tests/test_registry.py tests/test_jobs.py -q
 ```
 
 ## Troubleshooting
@@ -506,7 +571,13 @@ app/
   metering.py    usage events + plan-quota enforcement
   auth.py        hashed API keys (DB), principals with org + plan, dependencies
   middleware.py  auth + rate limit + security headers + access log (ASGI)
-  ratelimit.py   per-key sliding-window limiter
+  ratelimit.py   per-key sliding window + Redis global limiter (fallback)
+  cache.py       Redis client factory (None when REDIS_URL is empty)
+  queue.py       job queue: RedisJobQueue + InProcessJobQueue
+  registry.py    session registry over Redis (worker attribution)
+  storage.py     artifact store: S3 presigned + local signed-URL
+  jobs.py        job persistence, status transitions, webhook delivery
+  worker.py      job worker: fairness, retry, metering, webhook (python -m app.worker)
   snapshot.py    in-page JS that builds the ref-addressable snapshot
   browser.py     shared browser + isolated per-key session contexts
   actions.py     19 atomic actions
@@ -514,10 +585,10 @@ app/
   llm.py         minimal OpenAI-compatible async client
   agent.py       the perceive -> act -> observe loop
   sitecheck.py   the website test harness
-  main.py        FastAPI app (mounts the MCP server at /mcp)
+  main.py        FastAPI app (mounts the MCP server at /mcp, runs the inline worker)
   mcp_server.py  MCP server (22 tools, per-key sessions)
-  routers/       browser, agents, sitecheck, accounts, usage, admin
-migrations/      Alembic (0001 initial schema); alembic.ini at the root
+  routers/       browser, agents, sitecheck, accounts, usage, admin, jobs, artifacts
+migrations/      Alembic (0001 initial schema, 0002 job lifecycle); alembic.ini at root
 tests/           pytest suite + local fixture site
 examples/        demo.py, run_agent.py, mcp_client.py
 deploy/          Caddyfile (TLS reverse proxy)
