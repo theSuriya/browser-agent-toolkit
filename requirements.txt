@@ -19,3 +19,7 @@ redis==5.2.1
 # tests
 pytest==8.3.4
 pytest-asyncio==0.25.0
+fakeredis==2.26.2
+
+# Optional: S3 artifact storage (only imported when S3_BUCKET is set)
+boto3==1.35.90

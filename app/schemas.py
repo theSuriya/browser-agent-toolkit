@@ -139,5 +139,50 @@ class UsageSummary(BaseModel):
     screenshots: float
 
 
+# --- Async jobs (Phase 2) --------------------------------------------------
+from datetime import datetime as _dt  # noqa: E402
+from typing import Literal as _Literal  # noqa: E402
+
+
+class JobCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    kind: _Literal["agent", "sitecheck"]
+    input: dict[str, Any]
+    callback_url: str | None = Field(default=None, max_length=2048)
+
+    @field_validator("callback_url")
+    @classmethod
+    def _validate_callback(cls, value: str | None) -> str | None:
+        return value if value is None else validate_url(value)
+
+
+class JobOut(BaseModel):
+    id: str
+    kind: str
+    status: str
+    created_at: _dt
+    finished_at: _dt | None = None
+    result: dict[str, Any] | None = None
+    error: str | None = None
+
+    @classmethod
+    def from_job(cls, job: Any) -> "JobOut":
+        return cls(
+            id=job.id,
+            kind=job.kind,
+            status=job.status,
+            created_at=job.created_at,
+            finished_at=job.finished_at,
+            result=job.result,
+            error=job.error,
+        )
+
+
+class JobPage(BaseModel):
+    jobs: list[JobOut]
+    next_offset: int | None
+
+
 def agent_max_steps() -> int:
     return get_settings().agent_max_steps

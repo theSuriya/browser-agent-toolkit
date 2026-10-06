@@ -10,11 +10,34 @@ services:
       # rate limiting, the session registry and the job queue).
       DATABASE_URL: postgresql+asyncpg://bat:bat@postgres:5432/bat
       REDIS_URL: redis://redis:6379/0
+      # The dedicated worker below executes jobs; the API only enqueues them.
+      RUN_INLINE_WORKER: "false"
     ports:
       - "8080:8080"
     volumes:
       - ./artifacts:/app/artifacts
     # Chromium needs more than the default 64 MB /dev/shm.
+    shm_size: "1gb"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Browser worker: consumes jobs from Redis, runs them, meters usage, fires webhooks.
+  # Scale with `docker compose up --scale worker=N`.
+  worker:
+    build: .
+    image: browser-agent-toolkit:latest
+    command: ["python", "-m", "app.worker"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://bat:bat@postgres:5432/bat
+      REDIS_URL: redis://redis:6379/0
+      RUN_INLINE_WORKER: "false"
+    volumes:
+      - ./artifacts:/app/artifacts
     shm_size: "1gb"
     depends_on:
       postgres:

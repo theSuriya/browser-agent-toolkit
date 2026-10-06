@@ -25,12 +25,33 @@ class Settings(BaseSettings):
     mcp_http_path: str = "/mcp"
     default_plan: str = "free"
 
-    # Shared services (Phase 2: global rate limiting, session registry, queues)
+    # Shared services (Redis): global rate limiting, session registry, job queue.
+    # Empty URL disables Redis and falls back to per-process behaviour.
     redis_url: str = "redis://localhost:6379/0"
 
     # Billing (Stripe). Optional until billing is switched on.
     stripe_secret_key: str = ""
     stripe_webhook_secret: str = ""
+
+    # Async jobs / worker
+    run_inline_worker: bool = True       # run a worker inside the API process (single node)
+    jobs_max_concurrent_per_org: int = 2  # per-tenant fairness cap in the worker
+    job_max_attempts: int = 2             # a job whose worker crashes is retried once
+    job_lease_seconds: int = 300          # re-queue jobs stuck "running" past this
+    webhook_timeout_seconds: float = 10.0
+    webhook_signing_secret: str = ""      # HMAC-SHA256 key for X-BAT-Signature on webhooks
+    worker_poll_seconds: float = 1.0
+
+    # Artifacts (S3, or local disk with signed URLs)
+    artifact_base_url: str = "http://localhost:8080"
+    artifact_signing_secret: str = ""     # required for local signed URLs in production
+    artifact_ttl_seconds: int = 3600
+    s3_bucket: str = ""
+    s3_region: str = ""
+    s3_endpoint_url: str = ""
+
+    # Session registry (Redis)
+    session_registry_ttl_seconds: int = 1800
 
     # Browser
     browser_type: str = "chromium"

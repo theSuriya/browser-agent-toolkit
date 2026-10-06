@@ -19,6 +19,9 @@ from pathlib import Path
 # it on (tests/test_auth.py). Keep the key database out of the repository.
 os.environ.setdefault("REQUIRE_AUTH", "false")
 os.environ.setdefault("DB_PATH", os.path.join(tempfile.mkdtemp(prefix="bat-keys-"), "keys.db"))
+# Tests drive jobs through a Worker built with a fake executor, never the inline
+# worker, so the API process must not start one of its own.
+os.environ.setdefault("RUN_INLINE_WORKER", "false")
 
 import pytest
 

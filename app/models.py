@@ -147,7 +147,14 @@ class UsageEvent(Base):
 # -- Jobs and artifacts -----------------------------------------------------
 class Job(Base):
     __tablename__ = "jobs"
-    __table_args__ = (Index("idx_jobs_org_status", "org_id", "status"),)
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('queued','running','succeeded','failed')",
+            name="ck_jobs_status",
+        ),
+        Index("idx_jobs_org_status", "org_id", "status"),
+        Index("idx_jobs_status_created", "status", "created_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     org_id: Mapped[str] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
@@ -157,6 +164,10 @@ class Job(Base):
     input: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Worker bookkeeping: how many attempts were made and which worker holds the lease.
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    worker_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
